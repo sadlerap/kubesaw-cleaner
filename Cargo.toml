@@ -1,7 +1,9 @@
 [package]
-name = "finalizer-patcher"
+name = "kubesaw-cleaner"
 version = "0.1.0"
 edition = "2024"
+description = "A small tool to assist in removing kubesaw from a cluster"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 color-eyre = "0.6.5"

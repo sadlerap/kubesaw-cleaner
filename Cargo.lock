@@ -224,19 +224,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "finalizer-patcher"
-version = "0.1.0"
-dependencies = [
- "color-eyre",
- "itertools",
- "k8s-openapi",
- "kube",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -649,6 +636,19 @@ dependencies = [
  "serde-value",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "kubesaw-cleaner"
+version = "0.1.0"
+dependencies = [
+ "color-eyre",
+ "itertools",
+ "k8s-openapi",
+ "kube",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
