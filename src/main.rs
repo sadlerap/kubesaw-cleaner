@@ -1,14 +1,14 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use color_eyre::eyre::Context;
 use itertools::Itertools;
 use k8s_openapi::api::admissionregistration::v1::ValidatingWebhookConfiguration;
-use kube::{Api, Client, ResourceExt};
-use tracing::{error, info, instrument, level_filters::LevelFilter};
+use kube::{Api, Client};
+use tracing::{info, instrument, level_filters::LevelFilter};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-use crate::crds::{fetch_crds, patch_crs, process_crd};
+use crate::crds::{fetch_crds, process_crd};
 
 mod crds;
 
@@ -30,11 +30,18 @@ static MEMBER_LABEL_KEY: &str =
 #[derive(Subcommand)]
 enum Commands {
     /// Removes kubesaw from a host cluster.
-    CleanHost,
+    Host,
     /// Removes kubesaw from a member cluster.
-    CleanMember,
+    Member(WebhookArgs),
     /// Removes kubesaw from a cluster with both host-operator and member-operator.
-    CleanAll,
+    All(WebhookArgs),
+}
+
+#[derive(Args)]
+struct WebhookArgs {
+    /// Attempt to remove known ValidatingWebhookConfigurations owned by kubesaw.
+    #[arg(short, long, default_value_t = true)]
+    webhook: bool,
 }
 
 #[tokio::main]
@@ -75,9 +82,23 @@ async fn run() -> color_eyre::Result<()> {
 
     if let Some(command) = app.command {
         match command {
-            Commands::CleanHost => run_host(&client).await?,
-            Commands::CleanMember => run_member(&client).await?,
-            Commands::CleanAll => run_all(&client).await?,
+            Commands::Host => run_host(&client).await?,
+            Commands::Member(args) => {
+                if args.webhook {
+                    remove_webhook_configs(&client)
+                        .await
+                        .wrap_err("failed to remove stale webhooks, bailing")?;
+                }
+                run_member(&client).await?;
+            }
+            Commands::All(args) => {
+                if args.webhook {
+                    remove_webhook_configs(&client)
+                        .await
+                        .wrap_err("failed to remove stale webhooks, bailing")?;
+                }
+                run_all(&client).await?
+            },
         }
     }
 
@@ -86,20 +107,9 @@ async fn run() -> color_eyre::Result<()> {
 
 #[instrument(skip_all)]
 async fn run_member(client: &Client) -> color_eyre::Result<()> {
-    remove_webhook_configs(&client)
-        .await
-        .wrap_err("failed to remove stale webhooks, bailing")?;
-
     let member_crds = fetch_crds(client, MEMBER_LABEL_KEY).await?;
     for crd in member_crds {
-        info!(name = crd.name_any(), "patching crd instances");
-        let _ = patch_crs(&client, &crd).await.inspect_err(|e| {
-            error!(
-                "Failed to patch custom resource of type {:?}",
-                crd.name_any()
-            );
-            eprint!("{e}")
-        });
+        process_crd(client, &crd).await?;
     }
 
     Ok(())
@@ -109,14 +119,7 @@ async fn run_member(client: &Client) -> color_eyre::Result<()> {
 async fn run_host(client: &Client) -> color_eyre::Result<()> {
     let host_crds = fetch_crds(client, HOST_LABEL_KEY).await?;
     for crd in host_crds {
-        info!(name = crd.name_any(), "patching crd instances");
-        let _ = patch_crs(&client, &crd).await.inspect_err(|e| {
-            error!(
-                "Failed to patch custom resource of type {:?}",
-                crd.name_any()
-            );
-            eprint!("{e}")
-        });
+        process_crd(client, &crd).await?;
     }
 
     Ok(())
@@ -124,14 +127,6 @@ async fn run_host(client: &Client) -> color_eyre::Result<()> {
 
 #[instrument(skip_all)]
 async fn run_all(client: &Client) -> color_eyre::Result<()> {
-    // step 1: remove the "users.spacebindingsrequests.webhook.sandbox" validating webhook config,
-    // since its existance blocks patching spacebindingrequests
-    remove_webhook_configs(&client)
-        .await
-        .wrap_err("failed to remove stale webhooks, bailing")?;
-
-    // step 2: get all kubesaw crds
-    // they should have the OLM labels set, so we can use them
     let host_crds = fetch_crds(client, HOST_LABEL_KEY).await?;
     let member_crds = fetch_crds(client, MEMBER_LABEL_KEY).await?;
 

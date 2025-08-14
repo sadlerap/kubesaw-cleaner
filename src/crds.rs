@@ -20,7 +20,7 @@ pub async fn process_crd(
         eprint!("{e}")
     });
 
-    remove_crd(&client, crd)
+    remove_crd(client, crd)
         .await
         .wrap_err_with(|| format!("failed to delete crd {}", crd.name_any()))?;
     Ok(())
