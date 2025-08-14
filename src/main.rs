@@ -1,16 +1,44 @@
-use color_eyre::eyre::{eyre, Context};
+use std::path::PathBuf;
+
+use clap::{Parser, Subcommand};
+use color_eyre::eyre::Context;
 use itertools::Itertools;
 use k8s_openapi::{
     api::admissionregistration::v1::ValidatingWebhookConfiguration,
     apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition,
 };
-use kube::{
-    api::{ApiResource, DynamicObject, GroupVersionKind, ListParams},
-    core::Expression,
-    Api, Client, Resource, ResourceExt,
-};
-use tracing::{error, info, instrument, level_filters::LevelFilter, trace};
+use kube::{Api, Client, ResourceExt};
+use tracing::{error, info, instrument, level_filters::LevelFilter};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+
+use crate::crds::{fetch_crds, patch_crs, process_crd};
+
+mod crds;
+
+#[derive(Parser)]
+#[command(version, about, long_about = None)]
+struct App {
+    #[arg(short, long)]
+    kubeconfig: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+static HOST_LABEL_KEY: &str =
+    "operators.coreos.com/toolchain-host-operator.toolchain-host-operator";
+static MEMBER_LABEL_KEY: &str =
+    "operators.coreos.com/toolchain-member-operator.toolchain-member-operator";
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Removes kubesaw from a host cluster.
+    CleanHost,
+    /// Removes kubesaw from a member cluster.
+    CleanMember,
+    /// Removes kubesaw from a cluster with both host-operator and member-operator.
+    CleanAll,
+}
 
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {
@@ -37,10 +65,65 @@ fn init_tracing() -> color_eyre::Result<()> {
     Ok(())
 }
 
-#[instrument]
 async fn run() -> color_eyre::Result<()> {
+    let app = App::parse();
+
+    if let Some(kubeconfig) = app.kubeconfig {
+        unsafe {
+            std::env::set_var("KUBECONFIG", kubeconfig);
+        }
+    }
+
     let client = Client::try_default().await?;
 
+    if let Some(command) = app.command {
+        match command {
+            Commands::CleanHost => run_host(&client).await?,
+            Commands::CleanMember => run_member(&client).await?,
+            Commands::CleanAll => run_all(&client).await?,
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_member(client: &Client) -> color_eyre::Result<()> {
+    remove_webhook_configs(&client)
+        .await
+        .wrap_err("failed to remove stale webhooks, bailing")?;
+
+    let member_crds = fetch_crds(client, MEMBER_LABEL_KEY).await?;
+    for crd in member_crds {
+        info!(name = crd.name_any(), "patching crd instances");
+        let _ = patch_crs(&client, &crd).await.inspect_err(|e| {
+            error!(
+                "Failed to patch custom resource of type {:?}",
+                crd.name_any()
+            );
+            eprint!("{e}")
+        });
+    }
+
+    Ok(())
+}
+
+async fn run_host(client: &Client) -> color_eyre::Result<()> {
+    let host_crds = fetch_crds(client, HOST_LABEL_KEY).await?;
+    for crd in host_crds {
+        info!(name = crd.name_any(), "patching crd instances");
+        let _ = patch_crs(&client, &crd).await.inspect_err(|e| {
+            error!(
+                "Failed to patch custom resource of type {:?}",
+                crd.name_any()
+            );
+            eprint!("{e}")
+        });
+    }
+
+    Ok(())
+}
+
+async fn run_all(client: &Client) -> color_eyre::Result<()> {
     // step 1: remove the "users.spacebindingsrequests.webhook.sandbox" validating webhook config,
     // since its existance blocks patching spacebindingrequests
     remove_webhook_configs(&client)
@@ -49,38 +132,15 @@ async fn run() -> color_eyre::Result<()> {
 
     // step 2: get all kubesaw crds
     // they should have the OLM labels set, so we can use them
-    let crds: Api<CustomResourceDefinition> = Api::all(client.clone());
-    let host_expr = Expression::Exists(
-        "operators.coreos.com/toolchain-host-operator.toolchain-host-operator".into(),
-    );
-    let host_lp = ListParams::default().labels_from(&host_expr.into());
-    let host_crds = crds.list(&host_lp).await?;
-
-    let member_expr = Expression::Exists(
-        "operators.coreos.com/toolchain-member-operator.toolchain-member-operator".into(),
-    );
-    let member_lp = ListParams::default().labels_from(&member_expr.into());
-    let member_crds = crds.list(&member_lp).await?;
+    let host_crds = fetch_crds(client, HOST_LABEL_KEY).await?;
+    let member_crds = fetch_crds(client, MEMBER_LABEL_KEY).await?;
 
     for crd in host_crds
         .iter()
         .chain(member_crds.iter())
         .unique_by(|crd| &crd.metadata.name)
     {
-        info!(name = crd.metadata.name, "updating crds");
-        // step 3: patch all instances of our custom resources to remove their finalizer
-        let _ = patch_crs(&client, crd).await.inspect_err(|e| {
-            error!(
-                "Failed to update CRs for resource {:?}",
-                crd.metadata.name.as_deref().unwrap_or("")
-            );
-            eprint!("{e}");
-        });
-
-        // step 4: remove the crd itself
-        remove_crd(&client, crd)
-            .await
-            .wrap_err_with(|| format!("failed to delete crd {}", crd.name_any()))?;
+        process_crd(client, crd).await?;
     }
 
     Ok(())
@@ -96,88 +156,6 @@ async fn remove_webhook_configs(client: &Client) -> color_eyre::Result<()> {
         .await?
         .map_left(|_| info!("deleting webhooks"))
         .map_right(|_| info!("deleted webhook config"));
-
-    Ok(())
-}
-
-#[instrument(skip_all, fields(crd_name = crd.name_any()))]
-async fn remove_crd(client: &Client, crd: &CustomResourceDefinition) -> color_eyre::Result<()> {
-    let crds: Api<CustomResourceDefinition> = Api::all(client.clone());
-    if let Some(name) = crd.metadata.name.as_deref() {
-        crds.delete(name, &Default::default())
-            .await?
-            .map_left(|_| info!("deleting crd"))
-            .map_right(|_| info!("deleted crd"));
-    }
-    Ok(())
-}
-
-/// For a given custom resource definition, remove the finalizer for all instances
-#[instrument(skip_all, fields(crd_name = crd.name_any()))]
-async fn patch_crs(client: &Client, crd: &CustomResourceDefinition) -> color_eyre::Result<()> {
-    let version = crd
-        .spec
-        .versions
-        .iter()
-        .find(|v| v.storage)
-        .map(|v| v.name.clone())
-        .ok_or_else(|| {
-            error!(
-                name = crd.meta().name,
-                "failed to find storage version of crd"
-            );
-            color_eyre::eyre::eyre!("CRD parsing failed")
-        })?;
-    let dyntype = ApiResource::from_gvk_with_plural(
-        &GroupVersionKind::gvk(&crd.spec.group, &version, &crd.spec.names.kind),
-        &crd.spec.names.plural,
-    );
-    trace!(
-        version = dyntype.version,
-        group = dyntype.group,
-        kind = dyntype.kind,
-        apiVersion = dyntype.api_version,
-        plural = dyntype.plural
-    );
-    let cr_api: Api<DynamicObject> = Api::all_with(client.clone(), &dyntype);
-
-    for (namespace, name) in cr_api
-        .list(&ListParams::default())
-        .await
-        .map_err(|err| {
-            error!(?err, "failed to retrieve custom resources");
-            eyre!("failed to retrieve custom resources: {:?}", err)
-        })?
-        .iter()
-        .filter_map(|cr| {
-            Some((
-                cr.metadata.namespace.as_deref()?,
-                cr.metadata.name.as_deref()?,
-            ))
-        })
-    {
-        let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), namespace, &dyntype);
-        let mut object = api.get(name).await.map_err(|err| {
-            error!(?err, namespace, name, "failed to retrieve object");
-            eyre!("failed to retrieve object: {:?}", err)
-        })?;
-        if let Some(finalizers) = object.metadata.finalizers {
-            let new_finalizers = finalizers
-                .iter()
-                .filter(|f| *f != "finalizer.toolchain.dev.openshift.com")
-                .cloned()
-                .collect();
-
-            object.metadata.finalizers = Some(new_finalizers);
-            info!(name, namespace, "patching custom resource");
-            let _ = api
-                .replace(name, &Default::default(), &object)
-                .await
-                .inspect_err(|err| {
-                    error!(?err, namespace, name, "failed to update finalizers");
-                });
-        }
-    }
 
     Ok(())
 }
