@@ -3,10 +3,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use color_eyre::eyre::Context;
 use itertools::Itertools;
-use k8s_openapi::{
-    api::admissionregistration::v1::ValidatingWebhookConfiguration,
-    apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition,
-};
+use k8s_openapi::api::admissionregistration::v1::ValidatingWebhookConfiguration;
 use kube::{Api, Client, ResourceExt};
 use tracing::{error, info, instrument, level_filters::LevelFilter};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
@@ -87,6 +84,7 @@ async fn run() -> color_eyre::Result<()> {
     Ok(())
 }
 
+#[instrument(skip_all)]
 async fn run_member(client: &Client) -> color_eyre::Result<()> {
     remove_webhook_configs(&client)
         .await
@@ -107,6 +105,7 @@ async fn run_member(client: &Client) -> color_eyre::Result<()> {
     Ok(())
 }
 
+#[instrument(skip_all)]
 async fn run_host(client: &Client) -> color_eyre::Result<()> {
     let host_crds = fetch_crds(client, HOST_LABEL_KEY).await?;
     for crd in host_crds {
@@ -123,6 +122,7 @@ async fn run_host(client: &Client) -> color_eyre::Result<()> {
     Ok(())
 }
 
+#[instrument(skip_all)]
 async fn run_all(client: &Client) -> color_eyre::Result<()> {
     // step 1: remove the "users.spacebindingsrequests.webhook.sandbox" validating webhook config,
     // since its existance blocks patching spacebindingrequests
@@ -150,7 +150,7 @@ async fn remove_webhook_configs(client: &Client) -> color_eyre::Result<()> {
     let webhooks: Api<ValidatingWebhookConfiguration> = Api::all(client.clone());
     webhooks
         .delete(
-            "users.spacebindingrequests.webhook.sandbox",
+            "member-operator-validating-webhook-toolchain-member-operator",
             &Default::default(),
         )
         .await?
