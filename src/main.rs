@@ -40,7 +40,7 @@ enum Commands {
 #[derive(Args)]
 struct WebhookArgs {
     /// Attempt to remove known ValidatingWebhookConfigurations owned by kubesaw.
-    #[arg(short, long, default_value_t = true)]
+    #[arg(short, long)]
     webhook: bool,
 }
 
