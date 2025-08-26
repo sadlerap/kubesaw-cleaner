@@ -1,10 +1,10 @@
-use std::path::PathBuf;
+use std::{num::NonZeroU64, path::PathBuf, time::Duration};
 
 use clap::{Args, Parser, Subcommand};
 use color_eyre::eyre::Context;
 use itertools::Itertools;
 use k8s_openapi::api::admissionregistration::v1::ValidatingWebhookConfiguration;
-use kube::{Api, Client};
+use kube::{client::ClientBuilder, Api, Client, Config};
 use tracing::{info, instrument, level_filters::LevelFilter};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
@@ -17,6 +17,10 @@ mod crds;
 struct App {
     #[arg(short, long)]
     kubeconfig: Option<PathBuf>,
+
+    /// How many requests to allow per second
+    #[arg(short, long, default_value_t = 2.try_into().unwrap())]
+    rate: NonZeroU64,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -78,7 +82,13 @@ async fn run() -> color_eyre::Result<()> {
         }
     }
 
-    let client = Client::try_default().await?;
+    let config = Config::infer().await?;
+    let client = ClientBuilder::try_from(config)?
+        .with_layer(&tower::limit::RateLimitLayer::new(
+            app.rate.into(),
+            Duration::from_secs(1),
+        ))
+        .build();
 
     if let Some(command) = app.command {
         match command {
@@ -98,7 +108,7 @@ async fn run() -> color_eyre::Result<()> {
                         .wrap_err("failed to remove stale webhooks, bailing")?;
                 }
                 run_all(&client).await?
-            },
+            }
         }
     }
 

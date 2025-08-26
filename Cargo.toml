@@ -12,5 +12,6 @@ itertools = "0.14.0"
 k8s-openapi = { version = "0.25.0", features = ["earliest"] }
 kube = "1.1.0"
 tokio = { version = "1.47.1", features = ["full"] }
+tower = { version = "0.5.2", features = ["limit"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
